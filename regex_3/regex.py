@@ -469,6 +469,19 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
     "Compiles a regular expression to a PatternObject."
     global _cache_shrink_count
 
+    # Guess the encoding from the class of the pattern string.
+    if isinstance(pattern, str):
+        guess_encoding = UNICODE
+    elif isinstance(pattern, bytes):
+        guess_encoding = ASCII
+    elif isinstance(pattern, Pattern):
+        if flags:
+            raise ValueError("cannot process flags argument with a compiled pattern")
+
+        return pattern
+    else:
+        raise TypeError("first argument must be a string or compiled pattern")
+
     global DEFAULT_VERSION
     try:
         from regex import DEFAULT_VERSION
@@ -531,19 +544,6 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
         except KeyError:
             # It's a new pattern, or new named list for a known pattern.
             pass
-
-    # Guess the encoding from the class of the pattern string.
-    if isinstance(pattern, str):
-        guess_encoding = UNICODE
-    elif isinstance(pattern, bytes):
-        guess_encoding = ASCII
-    elif isinstance(pattern, Pattern):
-        if flags:
-            raise ValueError("cannot process flags argument with a compiled pattern")
-
-        return pattern
-    else:
-        raise TypeError("first argument must be a string or compiled pattern")
 
     # Set the default version in the core code in case it has been changed.
     _regex_core.DEFAULT_VERSION = DEFAULT_VERSION

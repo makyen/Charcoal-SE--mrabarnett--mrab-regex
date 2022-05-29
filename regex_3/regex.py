@@ -349,13 +349,15 @@ def finditer(pattern, string, flags=0, pos=None, endpos=None, overlapped=False,
 def compile(pattern, flags=0, ignore_unused=False, cache_pattern=None, **kwargs):
     "Compile a regular expression pattern, returning a pattern object."
     if cache_pattern is None:
-        cache_pattern = _cache_all
+        with _cache_all_lock:
+            cache_pattern = _cache_all
     return _compile(pattern, flags, ignore_unused, kwargs, cache_pattern)
 
 def purge():
     "Clear the regular expression cache"
-    _cache.clear()
-    _locale_sensitive.clear()
+    with _cache_lock, _locale_sensitive_lock:
+        _cache.clear()
+        _locale_sensitive.clear()
 
 # Whether to cache all patterns.
 _cache_all = True
@@ -365,10 +367,11 @@ def cache_all(value=True):
     Passing None has no effect, but returns the current setting."""
     global _cache_all
 
-    if value is None:
-        return _cache_all
+    with _cache_all_lock:
+        if value is None:
+            return _cache_all
 
-    _cache_all = value
+        _cache_all = value
 
 def template(pattern, flags=0):
     "Compile a template pattern, returning a pattern object."
@@ -432,7 +435,9 @@ from regex._regex_core import (ALNUM as _ALNUM, Info as _Info, OP as _OP, Source
 
 # Version 0 is the old behaviour, compatible with the original 're' module.
 # Version 1 is the new behaviour, which differs slightly.
-
+# No attempt is made to make dynamically setting the DEFAULT_VERSION thread safe.
+# If an application wants to dynamically set the version, then it should
+# use the regex version flags during compilation of the affected regexes.
 DEFAULT_VERSION = VERSION0
 
 _METACHARS = frozenset("()[]{}?*+|^$\\.-#&~")
@@ -443,8 +448,14 @@ _regex_core.DEFAULT_VERSION = DEFAULT_VERSION
 _cache = {}
 _cache_lock = _RLock()
 _named_args = {}
+_named_args_lock = _RLock()
 _replacement_cache = {}
+_replacement_cache_lock = _RLock()
 _locale_sensitive = {}
+_locale_sensitive_lock = _RLock()
+
+# Additional threading locks
+_cache_all_lock = _RLock()
 
 # Maximum size of the cache.
 _MAXCACHE = 500
@@ -465,7 +476,9 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
 
     # What locale is this pattern using?
     locale_key = (type(pattern), pattern)
-    if _locale_sensitive.get(locale_key, True) or (flags & LOCALE) != 0:
+    with _locale_sensitive_lock:
+        locale_sensitive_locale_key = _locale_sensitive.get(locale_key, True)
+    if locale_sensitive_locale_key or (flags & LOCALE) != 0:
         # This pattern is, or might be, locale-sensitive.
         pattern_locale = _getpreferredencoding()
     else:
@@ -476,7 +489,8 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
         try:
             # Do we know what keyword arguments are needed?
             args_key = pattern, type(pattern), flags
-            args_needed = _named_args[args_key]
+            with _named_args_lock:
+                args_needed = _named_args[args_key]
 
             # Are we being provided with its required keyword arguments?
             args_supplied = set()
@@ -492,7 +506,8 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
             # Have we already seen this regular expression and named list?
             pattern_key = (pattern, type(pattern), flags, args_supplied,
               DEFAULT_VERSION, pattern_locale)
-            return _cache[pattern_key]
+            with _cache_lock:
+                return _cache[pattern_key]
         except KeyError:
             # It's a new pattern, or new named list for a known pattern.
             pass
@@ -558,7 +573,8 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
     fuzzy = isinstance(parsed, _Fuzzy)
 
     # Remember whether this pattern as an inline locale flag.
-    _locale_sensitive[locale_key] = info.inline_locale
+    with _locale_sensitive_lock:
+        _locale_sensitive[locale_key] = info.inline_locale
 
     # Fix the group references.
     caught_exception = None
@@ -647,9 +663,10 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
       req_offset, req_chars, req_flags, info.group_count)
 
     # Do we need to reduce the size of the cache?
-    if len(_cache) >= _MAXCACHE:
-        with _cache_lock:
-            _shrink_cache(_cache, _named_args, _locale_sensitive, _MAXCACHE)
+    with _cache_lock:
+        if len(_cache) >= _MAXCACHE:
+            with _named_args_lock, _locale_sensitive_lock:
+                _shrink_cache(_cache, _named_args, _locale_sensitive, _MAXCACHE)
 
     if cache_it:
         if (info.flags & LOCALE) == 0:
@@ -660,10 +677,12 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
         # Store this regular expression and named list.
         pattern_key = (pattern, type(pattern), flags, args_needed,
           DEFAULT_VERSION, pattern_locale)
-        _cache[pattern_key] = compiled_pattern
+        with _cache_lock:
+            _cache[pattern_key] = compiled_pattern
 
         # Store what keyword arguments are needed.
-        _named_args[args_key] = args_needed
+        with _named_args_lock:
+            _named_args[args_key] = args_needed
 
     return compiled_pattern
 
@@ -673,12 +692,14 @@ def _compile_replacement_helper(pattern, template):
 
     # Have we seen this before?
     key = pattern.pattern, pattern.flags, template
-    compiled = _replacement_cache.get(key)
+    with _replacement_cache_lock:
+        compiled = _replacement_cache.get(key)
     if compiled is not None:
         return compiled
 
-    if len(_replacement_cache) >= _MAXREPCACHE:
-        _replacement_cache.clear()
+    with _replacement_cache_lock:
+        if len(_replacement_cache) >= _MAXREPCACHE:
+            _replacement_cache.clear()
 
     is_unicode = isinstance(template, str)
     source = _Source(template)
@@ -715,7 +736,8 @@ def _compile_replacement_helper(pattern, template):
     if literal:
         compiled.append(make_string(literal))
 
-    _replacement_cache[key] = compiled
+    with _replacement_cache_lock:
+        _replacement_cache[key] = compiled
 
     return compiled
 

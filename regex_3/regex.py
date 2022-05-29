@@ -507,7 +507,8 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
             pattern_key = (pattern, type(pattern), flags, args_supplied,
               DEFAULT_VERSION, pattern_locale)
             with _cache_lock:
-                return _cache[pattern_key]
+                compiled_pickle_data = _cache[pattern_key]
+            return _regex.compile(compiled_pickle_data)
         except KeyError:
             # It's a new pattern, or new named list for a known pattern.
             pass
@@ -669,20 +670,24 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
                 _shrink_cache(_cache, _named_args, _locale_sensitive, _MAXCACHE)
 
     if cache_it:
-        if (info.flags & LOCALE) == 0:
-            pattern_locale = None
+        try:
+            if (info.flags & LOCALE) == 0:
+                pattern_locale = None
 
-        args_needed = frozenset(args_needed)
+            args_needed = frozenset(args_needed)
 
-        # Store this regular expression and named list.
-        pattern_key = (pattern, type(pattern), flags, args_needed,
-          DEFAULT_VERSION, pattern_locale)
-        with _cache_lock:
-            _cache[pattern_key] = compiled_pattern
+            # Store this regular expression and named list.
+            pattern_key = (pattern, type(pattern), flags, args_needed,
+              DEFAULT_VERSION, pattern_locale)
+            compiled_pickled_data = compiled_pattern._pickled_data
+            with _cache_lock:
+                _cache[pattern_key] = compiled_pickled_data
 
-        # Store what keyword arguments are needed.
-        with _named_args_lock:
-            _named_args[args_key] = args_needed
+            # Store what keyword arguments are needed.
+            with _named_args_lock:
+                _named_args[args_key] = args_needed
+        except Exception:
+            pass
 
     return compiled_pattern
 

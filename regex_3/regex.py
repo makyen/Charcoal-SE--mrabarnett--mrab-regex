@@ -355,9 +355,11 @@ def compile(pattern, flags=0, ignore_unused=False, cache_pattern=None, **kwargs)
 
 def purge():
     "Clear the regular expression cache"
+    global _cache_shrink_count
     with _cache_lock, _locale_sensitive_lock:
         _cache.clear()
         _locale_sensitive.clear()
+        _cache_shrink_count += 1
 
 # Whether to cache all patterns.
 _cache_all = True
@@ -423,7 +425,8 @@ def escape(pattern, special_only=True, literal_spaces=False):
 
 import regex._regex_core as _regex_core
 import regex._regex as _regex
-from threading import RLock as _RLock
+from threading import (RLock as _RLock, main_thread as _main_thread,
+  current_thread as _current_thread, local as _thread_local)
 from locale import getpreferredencoding as _getpreferredencoding
 from regex._regex_core import *
 from regex._regex_core import (_ALL_VERSIONS, _ALL_ENCODINGS, _FirstSetError,
@@ -447,6 +450,7 @@ _regex_core.DEFAULT_VERSION = DEFAULT_VERSION
 # Caches for the patterns and replacements.
 _cache = {}
 _cache_lock = _RLock()
+_cache_shrink_count = 0
 _named_args = {}
 _named_args_lock = _RLock()
 _replacement_cache = {}
@@ -463,6 +467,7 @@ _MAXREPCACHE = 500
 
 def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
     "Compiles a regular expression to a PatternObject."
+    global _cache_shrink_count
 
     global DEFAULT_VERSION
     try:
@@ -506,9 +511,23 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
             # Have we already seen this regular expression and named list?
             pattern_key = (pattern, type(pattern), flags, args_supplied,
               DEFAULT_VERSION, pattern_locale)
+            is_main_thread, local_cache = _get_is_main_thread_and_local_cache()
+            if not is_main_thread:
+                if pattern_key not in _cache:
+                    local_cache.pop(pattern_key, None)
+                try:
+                    return local_cache[pattern_key]
+                except KeyError:
+                    # It's not in the local_cache
+                    pass
             with _cache_lock:
-                compiled_pickle_data = _cache[pattern_key]
-            return _regex.compile(compiled_pickle_data)
+                compiled_pattern = _cache[pattern_key]
+            if is_main_thread:
+                return compiled_pattern
+            else:
+                compiled_pattern_copy = _copy_compiled_pattern(compiled_pattern)
+                local_cache[pattern_key] = compiled_pattern_copy
+                return compiled_pattern_copy
         except KeyError:
             # It's a new pattern, or new named list for a known pattern.
             pass
@@ -663,13 +682,14 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
       info.group_index, index_group, named_lists, named_list_indexes,
       req_offset, req_chars, req_flags, info.group_count)
 
-    # Do we need to reduce the size of the cache?
-    with _cache_lock:
-        if len(_cache) >= _MAXCACHE:
-            with _named_args_lock, _locale_sensitive_lock:
-                _shrink_cache(_cache, _named_args, _locale_sensitive, _MAXCACHE)
-
     if cache_it:
+        # Do we need to reduce the size of the cache?
+        with _cache_lock:
+            if len(_cache) >= _MAXCACHE:
+                with _named_args_lock, _locale_sensitive_lock:
+                    _shrink_cache(_cache, _named_args, _locale_sensitive, _MAXCACHE)
+                _cache_shrink_count += 1
+
         try:
             if (info.flags & LOCALE) == 0:
                 pattern_locale = None
@@ -679,13 +699,18 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
             # Store this regular expression and named list.
             pattern_key = (pattern, type(pattern), flags, args_needed,
               DEFAULT_VERSION, pattern_locale)
-            compiled_pickled_data = compiled_pattern._pickled_data
+            is_main_thread, local_cache = _get_is_main_thread_and_local_cache()
+            if not is_main_thread:
+                local_cache[pattern_key] = compiled_pattern
+                # Use a copy for the main cache
+                compiled_pattern = _copy_compiled_pattern(compiled_pattern)
             with _cache_lock:
-                _cache[pattern_key] = compiled_pickled_data
+                _cache[pattern_key] = compiled_pattern
 
             # Store what keyword arguments are needed.
             with _named_args_lock:
                 _named_args[args_key] = args_needed
+
         except Exception:
             pass
 
@@ -745,6 +770,36 @@ def _compile_replacement_helper(pattern, template):
         _replacement_cache[key] = compiled
 
     return compiled
+
+def _get_is_main_thread_and_local_cache():
+    is_main_thread = _current_thread() is _main_thread()
+    if not is_main_thread:
+        with _cache_lock:
+            main_shrink_count = _cache_shrink_count
+        local_data = _thread_local()
+        try:
+            local_cache = local_data.mrabarnett_mrab_regex_cache
+            local_shrink_count = local_data.mrabarnett_mrab_regex_cache_shrink_count
+        except AttributeError:
+            local_cache = {}
+            local_data.mrabarnett_mrab_regex_cache = local_cache
+            local_shrink_count = main_shrink_count
+            local_data.mrabarnett_mrab_regex_cache_shrink_count = main_shrink_count
+        # Maintain sync between local cache and _cache if _shrink_cache has run.
+        if local_shrink_count != main_shrink_count:
+            # There's a cache shrink which hasn't been applied to the local_cache,
+            # so delete any entry in the local_cache which isn't in the _cache.
+            with _cache_lock:
+                to_delete = [key for key in local_cache.keys() if key not in _cache]
+            for key in to_delete:
+                del local_cache[key]
+            local_data.mrabarnett_mrab_regex_cache_shrink_count = main_shrink_count
+        return (False, local_cache)
+    else:
+        return (True, None)
+
+def _copy_compiled_pattern(compiled_pattern):
+    return _regex.compile(*compiled_pattern._pickled_data)
 
 # We define Pattern here after all the support objects have been defined.
 _pat = _compile('', 0, False, {}, False)
